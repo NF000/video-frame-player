@@ -1,7 +1,7 @@
 """主窗口：简洁控件布局、快捷键、拖拽打开、播放列表、全屏、定时刷新。
 
 交互约定：
-    空格            播放 / 暂停
+    空格 / 点击画面   播放 / 暂停
     方向右键        暂停态：单帧前进；播放态：快进 5 秒
     方向左键        暂停态：单帧后退；播放态：快退 5 秒
     F               切换全屏 / 退出全屏
@@ -22,8 +22,8 @@
   原子落盘一次。
 * 启动恢复延后到「窗口已显示 + 引擎已就绪」之后；文件夹遍历放后台线程，
   结果通过 Qt 信号回主线程，首帧不读盘、不扫目录。
-* seek 只在引擎 on_opened 回调之后做，且等待 VLC 解析出时长（有限次重试），
-  不新增任何同步阻塞的 libvlc 调用。
+* seek 只在引擎 on_opened 回调之后做，并等 VLC 真正进入可 seek 状态、
+  确认跳转已落地（有限次重试），不新增任何同步阻塞的 libvlc 调用。
 * 用户一旦主动打开内容，就放弃尚未完成的启动恢复，不覆盖用户操作。
 """
 from __future__ import annotations
@@ -66,12 +66,13 @@ PLAYLIST_WIDTH = 260  # 左侧播放列表固定宽度（需容纳子文件夹�
 SAVE_INTERVAL_MS = 5000        # 播放期间节流写盘间隔
 SAVE_POSITION_EPSILON_MS = 1000  # 位置变化不足 1 秒且无其它变更时跳过写盘
 RESTORE_DELAY_MS = 400         # 引擎就绪后再延迟恢复，避开启动首帧
-SEEK_RETRY_MS = 200            # 等 VLC 解析出时长的重试间隔
-MAX_SEEK_RETRIES = 8           # 最多等 1.6 秒，绝不无限等
+SEEK_RETRY_MS = 200            # 等 VLC 起播 / 确认 seek 的重试间隔
+MAX_SEEK_RETRIES = 15          # 最多等 3 秒，绝不无限等
+SEEK_TOLERANCE_MS = 1500       # 判定断点是否真正落地的容差
 RESTORE_TAIL_MS = 2000         # 断点太靠近片尾时从头播，避免恢复即自动续播
 
 HINT = (
-    "拖入视频或父文件夹（含所有子文件夹）  |  空格 播放/暂停  |  "
+    "拖入视频或父文件夹（含所有子文件夹）  |  空格 / 点击画面 播放暂停  |  "
     "→/← 播放态 ±5s、暂停态单帧  |  F 全屏"
 )
 
@@ -147,6 +148,7 @@ class MainWindow(QMainWindow):
         self._restore_was_playing = False
         self._restore_label = ""
         self._seek_attempts = 0
+        self._seek_submitted = False   # 断点 seek 是否已提交、等待下一拍校验
 
         self._build_ui()
         self._bind_shortcuts()
@@ -197,6 +199,8 @@ class MainWindow(QMainWindow):
         right = QVBoxLayout()
         right.setSpacing(6)
         self._video = VideoWidget(central)
+        # 点击画面切换播放/暂停（与空格键共用一个入口，busy 时自动忽略）
+        self._video.clicked.connect(self._on_toggle_play)
         right.addWidget(self._video, 1)  # stretch=1：窗口缩放时画面自适应
 
         # 第一行：进度条 + 时间
@@ -753,7 +757,9 @@ class MainWindow(QMainWindow):
 
     def _save_tick(self) -> None:
         """5 秒节流写盘：位置没明显变化且无其它改动就跳过。"""
-        if self._engine is None or self._current_path is None:
+        if (self._engine is None or self._current_path is None
+                or self._pending_seek_ms is not None):
+            # 恢复流程还没确认断点落地，别用 0 附近的临时位置覆盖存档
             return
         pos = max(0, int(self._last_position_ms))
         if (not self._save_dirty
@@ -866,27 +872,72 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(SEEK_RETRY_MS, self._apply_pending_seek)
 
     def _apply_pending_seek(self) -> None:
-        """媒体打开完成后的断点 seek：等 VLC 解析出时长，有限次重试。"""
+        """媒体打开后的断点 seek：提交 → 隔一拍校验 → 未落地再提交。
+
+        VLC 的 ``play()`` 是异步的，而且刚起播时 ``set_time()`` 会「乐观」
+        返回成功、``get_time()`` 也立刻报出目标值，但随后 demux 真正开始
+        时又把位置冲回 0（表现为「提示已恢复、实际从头播」）。所以不能
+        同拍校验：提交后隔 SEEK_RETRY_MS 再读一次，被冲掉就重新提交，
+        有限次重试；全部在主线程，不新增任何阻塞的 libvlc 调用。
+        """
         if self._pending_seek_ms is None or self._engine is None:
             return
-        busy = self._engine.is_busy()
-        length = 0 if busy else self._engine.get_length_ms()
-        if busy or (length <= 0 and self._seek_attempts < MAX_SEEK_RETRIES):
-            self._schedule_seek_retry()   # 不清除 pending，下一拍继续尝试
+        if self._engine.is_busy():
+            self._schedule_seek_retry()
             return
+
+        length = self._engine.get_length_ms()
+        pos = int(self._pending_seek_ms)
+        target = (
+            pos if pos > 0 and (length <= 0 or pos < length - RESTORE_TAIL_MS)
+            else 0
+        )   # 片尾断点：从头播，避免恢复即触发自动续播
+
+        # 阶段 1：等 VLC 进入可 seek 状态后提交跳转
+        if not self._seek_submitted:
+            seekable = self._engine.is_playing() or self._engine.is_paused()
+            logger.debug(
+                "恢复 seek 提交前: 第 %d 拍 pos=%d length=%d seekable=%s",
+                self._seek_attempts, pos, length, seekable,
+            )
+            if (length <= 0 or not seekable) \
+                    and self._seek_attempts < MAX_SEEK_RETRIES:
+                self._schedule_seek_retry()
+                return
+            if target > 0:
+                try:
+                    self._engine.set_time_ms(pos)
+                except Exception as exc:
+                    logger.warning("恢复播放位置失败: %s", exc)
+            self._seek_submitted = True
+            self._schedule_seek_retry()   # 下一拍才校验，避开乐观读值
+            return
+
+        # 阶段 2：延迟校验。VLC 若已把位置冲回 0，重新提交一轮
+        actual = self._engine.get_time_ms()
+        logger.debug(
+            "恢复 seek 延迟校验: 第 %d 拍 actual=%d target=%d",
+            self._seek_attempts, actual, target,
+        )
+        if target > 0 and abs(actual - target) > SEEK_TOLERANCE_MS:
+            self._seek_submitted = False
+            if self._seek_attempts < MAX_SEEK_RETRIES:
+                self._schedule_seek_retry()
+                return
+            logger.warning(
+                "恢复播放位置未能确认: 目标 %d ms，实际 %d ms", target, actual
+            )
+
         try:
-            pos = int(self._pending_seek_ms)
-            # 已看到片尾就从头播：避免一恢复就触发「播完自动续播」
-            if pos > 0 and (length <= 0 or pos < length - RESTORE_TAIL_MS):
-                self._engine.set_time_ms(pos)
             if self._grid is not None:
                 self._grid.sync_from_time()
             if not self._restore_was_playing:
                 self._engine.pause()
         except Exception as exc:
-            logger.warning("恢复播放位置失败: %s", exc)
+            logger.warning("恢复播放状态失败: %s", exc)
         finally:
             self._pending_seek_ms = None
+            self._seek_submitted = False
             self._refresh_frame_info()
             tip = "（空格继续播放）" if not self._restore_was_playing else "（继续播放）"
             self.statusBar().showMessage(
@@ -902,6 +953,7 @@ class MainWindow(QMainWindow):
         if self._pending_seek_ms is not None:
             # VLC 刚 play() 时可能还没解析出时长，延迟一拍再 seek（不阻塞）
             self._seek_attempts = 0
+            self._seek_submitted = False
             QTimer.singleShot(SEEK_RETRY_MS, self._apply_pending_seek)
             return
         self._refresh_frame_info()
@@ -983,14 +1035,17 @@ class MainWindow(QMainWindow):
         try:
             self._timer.stop()
             self._save_timer.stop()
+            self._video.stop_click_poll()
             if self._engine is not None and not self._engine.is_busy():
                 try:
                     self._last_position_ms = self._engine.get_time_ms()
                     self._last_duration_ms = self._engine.get_length_ms()
                 except Exception:
                     pass   # 用 _tick 缓存值兜底即可
-            if self._current_path is not None:
+            if (self._current_path is not None and self._engine is not None
+                    and self._pending_seek_ms is None):
                 # 同步原子写最终快照（<1ms），不等后台队列，关窗不拖慢
+                # 引擎没就绪 / 恢复未完成时不写，避免用空状态覆盖已有记录
                 self._session.flush(self._snapshot())
         except Exception as exc:
             logger.warning("保存观看记录失败: %s", exc)

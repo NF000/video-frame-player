@@ -7,10 +7,13 @@
   3. 强烈建议 onedir：onefile 解压到临时目录会破坏 plugins 的相对查找路径
   4. console=False 时看不到异常，调试期可临时改成 True
 """
+import os
 from pathlib import Path
 
 ROOT = Path(SPECPATH).parent.resolve()   # spec 位于 <项目根>/build/
-VLC = ROOT / "vendor" / "vlc"
+# 打包时复制哪份 VLC 运行时：环境变量 VLC_LIB_DIR 优先，否则用项目内置 vendor/vlc
+# （与 player/vlc_runtime.py 的查找规则保持一致）
+VLC = Path(os.environ.get("VLC_LIB_DIR") or str(ROOT / "vendor" / "vlc"))
 
 # VLC 运行时：两个 DLL 放根目录，plugins 整体作为目录
 # 运行时 vlc_runtime.locate() 会在 sys._MEIPASS / exe 同级找到它们

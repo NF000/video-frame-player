@@ -22,7 +22,7 @@ import ctypes
 import sys
 import time
 
-from PySide6.QtCore import QPoint, Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QCursor, QMouseEvent
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
@@ -112,21 +112,32 @@ class VideoWidget(QWidget):
     def nativeEvent(self, eventType, message):  # noqa: N802
         """VLC 的原生子窗口被点击时，父窗口会收到 WM_PARENTNOTIFY。
 
-        解析全程容错：任何异常都静默跳过，绝不因为兜底逻辑影响视频输出。
+        这个钩子会被 Qt 用于**每一条** Windows 消息，VLC 播放时消息量很大，
+        因此这里必须极轻：先做类型/消息号短路，绝大多数消息只做一两次
+        整数比较就返回，不构造 ctypes 对象、不查 QWidget 几何、不抛异常。
+        任何异常都静默跳过，绝不因为兜底逻辑影响视频输出。
         """
-        if _IS_WINDOWS and eventType in _NATIVE_EVENT_TYPES:
-            try:
-                msg = ctypes.cast(int(message), ctypes.POINTER(_MSG)).contents
-                if msg.message == WM_PARENTNOTIFY:
-                    code = int(msg.wParam) & 0xFFFF
-                    if code in (WM_LBUTTONDOWN, WM_LBUTTONDBLCLK):
-                        raw = int(msg.lParam)
-                        x = ctypes.c_short(raw & 0xFFFF).value
-                        y = ctypes.c_short((raw >> 16) & 0xFFFF).value
-                        if self.rect().contains(QPoint(x, y)):
-                            self._report_click()
-            except Exception:
-                pass
+        if not (_IS_WINDOWS and eventType in _NATIVE_EVENT_TYPES):
+            return False, 0
+        # PySide6 把 MSG* 作为 int 传入；个别版本传其它指针包装对象，
+        # 直接跳过（由轮询兜底），避免每条消息都构造一次 Python 异常。
+        if not isinstance(message, int):
+            return False, 0
+        try:
+            msg = ctypes.cast(message, ctypes.POINTER(_MSG)).contents
+            if msg.message != WM_PARENTNOTIFY:
+                return False, 0
+            if (int(msg.wParam) & 0xFFFF) not in (WM_LBUTTONDOWN, WM_LBUTTONDBLCLK):
+                return False, 0
+            raw = int(msg.lParam)
+            x = ctypes.c_short(raw & 0xFFFF).value
+            y = ctypes.c_short((raw >> 16) & 0xFFFF).value
+            # 纯数值比较：rect().contains(QPoint(...)) 会在原生消息分发期间
+            # 触发额外的 QWidget 几何查询，这里没必要。
+            if 0 <= x < self.width() and 0 <= y < self.height():
+                self._report_click()
+        except Exception:
+            pass
         # 返回 false 表示不消费原生消息，Qt 仍按默认流程分发
         return False, 0
 

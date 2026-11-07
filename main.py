@@ -5,7 +5,7 @@
     python main.py
 
 VLC 运行时由 player/vlc_runtime.py 在引擎初始化时自动定位，
-优先级：项目 vendor/vlc/ > 环境变量 VLC_LIB_DIR > 系统安装的 VLC。
+优先级：环境变量 VLC_LIB_DIR > 项目 vendor/vlc/ > 系统安装的 VLC。
 """
 from __future__ import annotations
 

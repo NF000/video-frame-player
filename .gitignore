@@ -1,0 +1,85 @@
+# ============================================================
+# Windows 桌面视频逐帧播放器 (video-frame-player) — Git 忽略规则
+#
+# 位置说明：本仓库根是 video-frame-player/（工作区根 D:\project\windows-project
+#           不是 git 仓库，工作区根的 .vscode / .workbuddy 不在版本控制范围内）。
+# 原则：源码、打包脚本、依赖声明、README 一律保留；
+#       仅忽略「可重新生成 / 本机环境相关 / 第三方大体积二进制」的内容。
+# 注意：gitignore 只支持整行注释，规则行末尾不能跟 # 说明文字。
+# ============================================================
+
+# ---------- 1. 打包与构建产物（可由 build/build_exe.bat 重新生成） ----------
+# PyInstaller onedir 成品，约 260MB（分发用，不入库）
+/dist/
+# PyInstaller --workpath 中间产物（.toc/.pyz/.pkg/xref 等）
+/output/
+# 只忽略 build 下自动生成的目录；build_exe.spec、build_exe.bat 是源码，必须保留
+/build/*/
+# VLC 下载/解压临时缓存（vlc-3.0.24，约 190MB）
+/.tmp/
+*.toc
+*.pyz
+*.pkg
+xref-*.html
+warn-*.txt
+base_library.zip
+
+# ---------- 2. 第三方运行时：VLC 3.0.24 win64 便携版（约 143MB） ----------
+# vendor/vlc 里是 libvlc.dll / libvlccore.dll / plugins/ 等第三方二进制，
+# 不是本仓库源码，可从 VLC 官方 win64 压缩包重新获得；入库会让仓库暴涨，
+# 也容易撞上托管平台单文件 100MB 上限。
+# 若确实要把便携 VLC 随仓库一起上传：把下面这一行注释掉即可。
+/vendor/vlc/
+
+# ---------- 3. Python 通用 ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+ENV/
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# ---------- 4. 编辑器 / 操作系统 / 本地工具数据 ----------
+# 仅忽略「上传」，不会删除本机文件
+.vscode/
+.idea/
+*.code-workspace
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/
+# 本地会话与记忆数据（若项目目录内生成）
+.workbuddy/
+
+# ---------- 5. 运行期可能生成的本地文件 ----------
+*.log
+logs/
+.env
+.env.*
+!.env.example
+*.local
+config.local.*
+/cache/
+
+# ---------- 6. 逐帧分析/截图导出（预留，方便以后加导出功能） ----------
+/snapshots/
+/exports/
+/frames/

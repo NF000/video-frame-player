@@ -1,0 +1,5 @@
+# Windows 桌面视频逐帧播放器 - 运行依赖
+# 安装命令见交付说明 ③；VLC 运行时不通过 pip 安装，放在 vendor/vlc/
+PySide6>=6.8,<7
+python-vlc>=3.0.12118
+pyinstaller>=6.0

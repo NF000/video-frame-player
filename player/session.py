@@ -1,9 +1,15 @@
 """观看记录 / 断点续播：会话状态持久化。
 
-设计目标（保持流畅度）
-----------------------
-* 状态文件只有几百字节，放在 ``%APPDATA%\\VideoFramePlayer\\session.json``，
-  不污染项目目录，PyInstaller 打包后同样可写。
+设计目标（保持流畅度 + 运行数据不出项目目录）
+----------------------------------------------
+* **数据落项目目录，不写 C 盘**：状态文件默认写在项目自身目录 —— 源码运行
+  时是工程根，PyInstaller onedir 冻结态是 exe 所在的分发文件夹。整个文件夹
+  搬到别的盘、别的机器，观看记录跟着走。只有显式设置 ``VFP_DATA_DIR`` 才
+  改到别处（用于只读介质 / 权限受限的部署）。
+* **旧存档一次性搬迁**：首次启动时若新位置还没有存档、但
+  ``%APPDATA%\\VideoFramePlayer\\session.json`` 存在，就把它复制过来，并把
+  旧文件改名为 ``session.json.migrated`` 留作备份（不删除、不覆盖新文件）。
+  任何失败都只记日志，绝不阻断启动。
 * 播放期间所有写盘都在**后台 daemon 线程**完成，主线程只投递快照；连续投递
   会合并，只保留最新一份，避免频繁 I/O 影响播放。
 * 写盘用「临时文件 + os.replace」原子替换，中途崩溃不会留下半个 JSON。
@@ -22,6 +28,7 @@ import json
 import logging
 import os
 import queue
+import sys
 import threading
 from dataclasses import dataclass
 from datetime import datetime
@@ -33,12 +40,100 @@ VERSION = 1
 _MAX_POSITION_MS = 7 * 24 * 3600 * 1000   # 7 天，防止存档里的异常值
 _MAX_INDEX = 1_000_000
 
+APP_NAME = "VideoFramePlayer"
+SESSION_FILENAME = "session.json"
+DATA_DIR_ENV = "VFP_DATA_DIR"
+
+# 源码态：工程根（player/session.py 的上两级）；冻结态：exe 所在分发文件夹。
+# 与 player/vlc_runtime.py 的源码态/冻结态判断、script2video 的 D5 约定一致。
+FROZEN = bool(getattr(sys, "frozen", False))
+SOURCE_ROOT = Path(__file__).resolve().parents[1]
+EXE_DIR = Path(sys.executable).resolve().parent if FROZEN else SOURCE_ROOT
+
+
+def resolve_data_root(
+    *, frozen: bool, exe_dir: Path, root: Path,
+    override: str | Path | None = None,
+) -> Path:
+    """解析可写数据根：默认落在项目目录，绝不落到 C 盘用户目录。
+
+    * 冻结态 → exe 所在文件夹（onedir 分发目录）；
+    * 源码态 → 工程根；
+    * ``VFP_DATA_DIR`` → 显式覆盖，仅用于只读介质 / 权限受限等特殊部署。
+    """
+    if override:
+        return Path(override).expanduser().resolve()
+    return Path(exe_dir if frozen else root).resolve()
+
+
+def data_root() -> Path:
+    """当前进程的数据根；每次读取环境变量，便于测试与运行时调整。"""
+    return resolve_data_root(
+        frozen=FROZEN,
+        exe_dir=EXE_DIR,
+        root=SOURCE_ROOT,
+        override=os.environ.get(DATA_DIR_ENV),
+    )
+
 
 def default_session_path() -> Path:
-    """Windows 用户级数据目录：可写、不随程序目录变化。"""
+    """观看记录默认路径：数据根下的 session.json（项目目录，非 APPDATA）。"""
+    return data_root() / SESSION_FILENAME
+
+
+def legacy_session_path() -> Path:
+    """旧版存档位置（只读，用于一次性搬迁）。
+
+    旧版把状态写在 ``%APPDATA%\\VideoFramePlayer\\session.json``；这里仅用于
+    **读取**，新版不会再往 C 盘写任何运行数据。
+    """
     appdata = os.environ.get("APPDATA")
     base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
-    return base / "VideoFramePlayer" / "session.json"
+    return base / APP_NAME / SESSION_FILENAME
+
+
+def migrate_legacy_session(
+    new_path: Path | None = None, legacy: Path | None = None,
+) -> bool:
+    """把旧 APPDATA 存档一次性搬到项目目录；返回是否写入了新文件。
+
+    规则：
+      * 新位置已有存档 → 不覆盖，避免用旧快照盖掉真实进度；
+      * 旧文件复制成功后改名为 ``session.json.migrated`` 留作备份，不删除；
+      * 新旧路径相同或旧文件不存在 → 什么都不做；
+      * 任何异常只记日志，绝不抛给调用方（观看记录不能影响启动）。
+
+    只做字节级搬运，不解析 JSON —— 内容是否合法交给 ``SessionStore.load()``
+    的容错逻辑判断。
+    """
+    dest = Path(new_path) if new_path is not None else default_session_path()
+    src = Path(legacy) if legacy is not None else legacy_session_path()
+    try:
+        if src.resolve() == dest.resolve():
+            return False
+        if not src.is_file():
+            return False
+        wrote = False
+        if dest.is_file():
+            logger.info("观看记录已在新位置，跳过旧存档搬迁: %s", dest)
+        else:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dest.with_name(dest.name + ".tmp")
+            tmp.write_bytes(src.read_bytes())   # 原子替换，避免半个 JSON
+            os.replace(tmp, dest)
+            wrote = True
+            logger.info("已把旧观看记录搬迁到项目目录: %s -> %s", src, dest)
+        # 归档旧文件：不再让它占据 session.json 这个名字，但保留数据可回溯
+        backup = src.with_name(src.name + ".migrated")
+        try:
+            os.replace(src, backup)
+            logger.info("旧存档已归档为 %s（未删除）", backup)
+        except OSError as exc:
+            logger.debug("旧存档归档失败（不影响使用）: %s", exc)
+        return wrote
+    except (OSError, ValueError) as exc:
+        logger.warning("旧观看记录搬迁失败，按无记录处理: %s", exc)
+        return False
 
 
 @dataclass
@@ -122,7 +217,13 @@ class SessionStore:
     """
 
     def __init__(self, path: Path | None = None) -> None:
-        self.path = Path(path) if path is not None else default_session_path()
+        if path is None:
+            # 使用默认路径时才做一次性搬迁；显式传路径（测试 / 特殊部署）
+            # 不应去动用户真实的 APPDATA 存档。
+            self.path = default_session_path()
+            migrate_legacy_session(self.path)
+        else:
+            self.path = Path(path)
         self._queue: queue.Queue[tuple[int, SessionState] | None] = queue.Queue()
         self._seq_lock = threading.Lock()
         self._seq = 0

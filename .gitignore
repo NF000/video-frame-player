@@ -78,6 +78,12 @@ logs/
 *.local
 config.local.*
 /cache/
+# 观看记录（运行态数据，默认写项目目录 / 冻结态写 exe 所在分发文件夹）。
+# 源码态在工程根，冻结态在 dist/VideoFramePlayer/（整个 dist/ 已被忽略）。
+# 不入库：换机器、重装、clone 后都不应继承别人看到哪一集。
+/session.json
+/session.json.tmp
+/session.json.migrated
 
 # ---------- 6. 逐帧分析/截图导出（预留，方便以后加导出功能） ----------
 /snapshots/

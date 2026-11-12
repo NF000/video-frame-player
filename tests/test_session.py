@@ -22,7 +22,11 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QTimer  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from player.session import SessionState, SessionStore, VERSION  # noqa: E402
+from player import session as session_mod  # noqa: E402
+from player.session import (  # noqa: E402
+    SessionState, SessionStore, VERSION, default_session_path,
+    migrate_legacy_session, resolve_data_root,
+)
 from ui.main_window import MainWindow  # noqa: E402
 
 
@@ -366,6 +370,140 @@ class RestoreTests(unittest.TestCase):
                 saved = store.load()
                 self.assertIsNotNone(saved)
                 self.assertEqual(saved.folder, "")
+
+
+class DataRootTests(unittest.TestCase):
+    """运行数据落项目目录（D5）：默认路径、冻结态、环境变量覆盖。"""
+
+    def test_default_path_is_project_dir_not_appdata(self) -> None:
+        path = default_session_path()
+        self.assertEqual(path.name, "session.json")
+        self.assertEqual(path.parent.resolve(), session_mod.SOURCE_ROOT.resolve())
+        self.assertNotIn("appdata", str(path).lower())
+        self.assertNotIn("users", str(path).lower())
+        self.assertFalse(session_mod.FROZEN, "测试应跑在源码态")
+
+    def test_resolve_data_root_frozen_and_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            exe_dir = base / "dist" / "VideoFramePlayer"
+            root = base / "project"
+            self.assertEqual(
+                resolve_data_root(frozen=True, exe_dir=exe_dir, root=root),
+                exe_dir.resolve(),
+            )
+            self.assertEqual(
+                resolve_data_root(frozen=False, exe_dir=exe_dir, root=root),
+                root.resolve(),
+            )
+            override = base / "custom-data"
+            self.assertEqual(
+                resolve_data_root(frozen=True, exe_dir=exe_dir, root=root,
+                                  override=override),
+                override.resolve(),
+            )
+
+    def test_env_override_changes_session_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {session_mod.DATA_DIR_ENV: tmp}):
+                self.assertEqual(session_mod.data_root(), Path(tmp).resolve())
+                self.assertEqual(
+                    default_session_path(),
+                    Path(tmp).resolve() / "session.json",
+                )
+
+    def test_legacy_path_is_read_only_and_points_to_appdata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"APPDATA": tmp}):
+                self.assertEqual(
+                    session_mod.legacy_session_path(),
+                    Path(tmp) / "VideoFramePlayer" / "session.json",
+                )
+
+
+class MigrationTests(unittest.TestCase):
+    """旧 %APPDATA% 存档一次性搬迁：不覆盖、不删除、不阻断启动。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        base = Path(self._tmp.name)
+        self.legacy = base / "legacy" / "VideoFramePlayer" / "session.json"
+        self.new = base / "project" / "session.json"
+        self.legacy.parent.mkdir(parents=True, exist_ok=True)
+        self.new.parent.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _state_json(position_ms: int) -> str:
+        return json.dumps({
+            "version": VERSION, "folder": "D:/videos",
+            "current_path": "D:/videos/a.mp4", "index": 1,
+            "position_ms": position_ms, "duration_ms": 120000,
+            "rate": 1.0, "volume": 80, "muted": False,
+            "was_playing": False, "auto_resume": True,
+        }, ensure_ascii=False)
+
+    def test_migrates_and_keeps_backup(self) -> None:
+        self.legacy.write_text(self._state_json(8801), encoding="utf-8")
+        self.assertTrue(migrate_legacy_session(self.new, self.legacy))
+        self.assertTrue(self.new.is_file())
+        self.assertEqual(
+            json.loads(self.new.read_text(encoding="utf-8"))["position_ms"], 8801
+        )
+        self.assertFalse(self.legacy.is_file(), "旧路径不应再留 session.json")
+        backup = self.legacy.with_name(self.legacy.name + ".migrated")
+        self.assertTrue(backup.is_file(), "旧存档应改名保留，不得删除")
+        self.assertEqual(
+            backup.read_bytes(), self.new.read_bytes(), "备份内容应与新存档一致"
+        )
+
+    def test_does_not_overwrite_existing_new_file(self) -> None:
+        self.new.write_text(self._state_json(9999), encoding="utf-8")
+        self.legacy.write_text(self._state_json(1111), encoding="utf-8")
+        self.assertFalse(migrate_legacy_session(self.new, self.legacy))
+        self.assertEqual(
+            json.loads(self.new.read_text(encoding="utf-8"))["position_ms"], 9999
+        )
+
+    def test_missing_legacy_is_noop(self) -> None:
+        self.assertFalse(migrate_legacy_session(self.new, self.legacy))
+        self.assertFalse(self.new.exists())
+
+    def test_same_path_is_noop(self) -> None:
+        self.new.write_text(self._state_json(1234), encoding="utf-8")
+        self.assertFalse(migrate_legacy_session(self.new, self.new))
+        self.assertTrue(self.new.is_file())
+
+    def test_corrupt_legacy_is_moved_and_load_degrades(self) -> None:
+        self.legacy.write_text("{not json", encoding="utf-8")
+        self.assertTrue(migrate_legacy_session(self.new, self.legacy))
+        self.assertIsNone(SessionStore(self.new).load(), "坏 JSON 应静默降级")
+
+    def test_write_failure_is_nonfatal(self) -> None:
+        # 目标父路径是一个普通文件 → mkdir 抛 OSError，搬迁必须吞掉异常
+        blocker = self.new.parent / "blocked"
+        blocker.write_text("x", encoding="utf-8")
+        self.legacy.write_text(self._state_json(4321), encoding="utf-8")
+        self.assertFalse(
+            migrate_legacy_session(blocker / "session.json", self.legacy)
+        )
+        self.assertTrue(self.legacy.is_file(), "失败时不得破坏旧存档")
+
+    def test_default_store_triggers_migration(self) -> None:
+        """MainWindow 用的无参 SessionStore() 应自动把旧存档搬进数据根。"""
+        self.legacy.write_text(self._state_json(7777), encoding="utf-8")
+        project = self.new.parent
+        with patch.dict(os.environ, {session_mod.DATA_DIR_ENV: str(project)}), \
+                patch("player.session.legacy_session_path",
+                      return_value=self.legacy):
+            store = SessionStore()
+            self.assertEqual(store.path.resolve(), self.new.resolve())
+            loaded = store.load()
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded.position_ms, 7777)
+        self.assertFalse(self.legacy.is_file())
 
 
 if __name__ == "__main__":
